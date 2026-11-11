@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Marker phone selftest</title>
+</head>
+<body>
+  <pre id="log">running</pre>
+  <script>
+    window.addEventListener("error", (event) => {
+      document.getElementById("log").textContent = `FAIL\n${event.message}`;
+      document.title = "FAIL";
+    });
+    window.addEventListener("unhandledrejection", (event) => {
+      const reason = event.reason && event.reason.stack ? event.reason.stack : event.reason;
+      document.getElementById("log").textContent = `FAIL\n${reason}`;
+      document.title = "FAIL";
+    });
+  </script>
+  <script type="module">
+    import { canonical, createIdentity, decodeBundle, encodeBundle, signEntry, verifyEnvelope } from "./js/crypto.js";
+    import { CURRENCIES, assertProposal, fold, fromMinor, standings, toMinor } from "./js/ledger.js";
+
+    const log = [];
+    function check(name, ok) {
+      log.push(`${ok ? "ok" : "FAIL"} ${name}`);
+      if (!ok) log.failed = true;
+    }
+
+    const sam = await createIdentity();
+    const alex = await createIdentity();
+    check("keys differ", sam.pub !== alex.pub && sam.pub.length > 20);
+
+    const profile = await signEntry(sam.privateKey, {
+      v: 1, id: "p-sam", type: "profile", at: "2026-11-07T12:00:00.000Z", by: sam.pub, body: { name: "Sam" },
+    });
+    check("profile verifies", await verifyEnvelope(profile));
+    const tampered = { entry: { ...profile.entry, body: { name: "Not Sam" } }, sig: profile.sig };
+    check("tamper fails", !(await verifyEnvelope(tampered)));
+    const flipped = profile.sig.slice(-2) === "aa" ? "bb" : "aa";
+    check("bad signature fails", !(await verifyEnvelope({ entry: profile.entry, sig: profile.sig.slice(0, -2) + flipped })));
+
+    const alexProfile = await signEntry(alex.privateKey, {
+      v: 1, id: "p-alex", type: "profile", at: "2026-11-07T12:00:01.000Z", by: alex.pub, body: { name: "Alex" },
+    });
+
+    function proposalBody(betId, makerStake, takerStake, title = "Sunday pickleball") {
+      return {
+        betId,
+        taker: alex.pub,
+        title,
+        start: "2026-11-08T18:00:00.000Z",
+        sport: "custom",
+        makerPick: "Sam's side",
+        takerPick: "Alex's side",
+        makerStake,
+        takerStake,
+        currency: CURRENCIES.USD,
+        note: "",
+      };
+    }
+
+    const proposed = await signEntry(sam.privateKey, {
+      v: 1, id: "bet-1", type: "proposal", at: "2026-11-07T12:01:00.000Z", by: sam.pub,
+      body: proposalBody("bet-sunday", 400, 400),
+    });
+    const makerAccept = await signEntry(sam.privateKey, {
+      v: 1, id: "bad-accept", type: "accept", at: "2026-11-07T12:02:00.000Z", by: sam.pub, body: { betId: "bet-sunday" },
+    });
+    let folded = fold([profile, alexProfile, proposed, makerAccept]);
+    check("maker cannot accept", folded.bets["bet-sunday"].status === "proposed");
+
+    const accept = await signEntry(alex.privateKey, {
+      v: 1, id: "accept-1", type: "accept", at: "2026-11-07T12:03:00.000Z", by: alex.pub, body: { betId: "bet-sunday" },
+    });
+    folded = fold([accept, proposed, alexProfile, profile]);
+    check("accept opens", folded.bets["bet-sunday"].status === "open");
+
+    const outsider = await createIdentity();
+    const badSettle = await signEntry(outsider.privateKey, {
+      v: 1, id: "settle-x", type: "settle", at: "2026-11-07T12:04:00.000Z", by: outsider.pub,
+      body: { betId: "bet-sunday", result: "maker" },
+    });
+    folded = fold([profile, alexProfile, proposed, accept, badSettle]);
+    check("outsider settle ignored", folded.bets["bet-sunday"].status === "open" && !folded.bets["bet-sunday"].winner);
+
+    const settled = await signEntry(sam.privateKey, {
+      v: 1, id: "settle-1", type: "settle", at: "2026-11-07T12:05:00.000Z", by: sam.pub,
+      body: { betId: "bet-sunday", result: "maker" },
+    });
+    folded = fold([profile, alexProfile, proposed, accept, settled]);
+    let table = standings(folded.bets, folded.names);
+    check("sam recorded the win", table.leaderboard.find((row) => row.pub === sam.pub).wins === 1);
+    check("alex recorded the loss", table.leaderboard.find((row) => row.pub === alex.pub).losses === 1);
+    check("even stake moves four dollars", table.owes.length === 1 && table.owes[0].from === alex.pub && table.owes[0].to === sam.pub && table.owes[0].minor === 400);
+
+    const uneven = await signEntry(sam.privateKey, {
+      v: 1, id: "bet-2", type: "proposal", at: "2026-11-07T13:00:00.000Z", by: sam.pub,
+      body: proposalBody("bet-uneven", 200, 500),
+    });
+    const unevenAccept = await signEntry(alex.privateKey, {
+      v: 1, id: "acc-2", type: "accept", at: "2026-11-07T13:01:00.000Z", by: alex.pub, body: { betId: "bet-uneven" },
+    });
+    const unevenSettle = await signEntry(alex.privateKey, {
+      v: 1, id: "set-2", type: "settle", at: "2026-11-07T13:02:00.000Z", by: alex.pub,
+      body: { betId: "bet-uneven", result: "taker" },
+    });
+    folded = fold([profile, alexProfile, uneven, unevenAccept, unevenSettle]);
+    const unevenOwe = standings(folded.bets, folded.names).owes;
+    check("uneven bet moves the loser's stake", unevenOwe.length === 1 && unevenOwe[0].from === sam.pub && unevenOwe[0].minor === 200);
+
+    const declinedBet = await signEntry(sam.privateKey, {
+      v: 1, id: "bet-3", type: "proposal", at: "2026-11-07T14:00:00.000Z", by: sam.pub,
+      body: proposalBody("bet-monday", 100, 100, "Monday chess"),
+    });
+    const decline = await signEntry(alex.privateKey, {
+      v: 1, id: "dec-3", type: "decline", at: "2026-11-07T14:01:00.000Z", by: alex.pub, body: { betId: "bet-monday" },
+    });
+    folded = fold([profile, alexProfile, declinedBet, decline]);
+    check("decline drops the bet", folded.bets["bet-monday"].status === "declined");
+    check("decline changes no record", standings(folded.bets, folded.names).leaderboard.every((row) => row.wins + row.losses + row.pushes === 0));
+
+    const withdrawLate = await signEntry(sam.privateKey, {
+      v: 1, id: "wd-late", type: "withdraw", at: "2026-11-07T12:04:00.000Z", by: sam.pub, body: { betId: "bet-sunday" },
+    });
+    folded = fold([profile, alexProfile, proposed, withdrawLate, accept]);
+    check("earlier accept beats a later withdraw", folded.bets["bet-sunday"].status === "open");
+
+    const withdrawEarly = await signEntry(sam.privateKey, {
+      v: 1, id: "wd-early", type: "withdraw", at: "2026-11-07T12:01:30.000Z", by: sam.pub, body: { betId: "bet-sunday" },
+    });
+    folded = fold([profile, alexProfile, proposed, accept, withdrawEarly]);
+    check("earlier withdraw beats a later accept", folded.bets["bet-sunday"].status === "withdrawn");
+
+    const forward = fold([profile, alexProfile, proposed, accept, settled]);
+    const backward = fold([settled, accept, proposed, alexProfile, profile]);
+    check("the same entries converge", JSON.stringify(forward) === JSON.stringify(backward));
+
+    const acceptAgain = await signEntry(alex.privateKey, {
+      v: 1, id: "accept-again", type: "accept", at: "2026-11-07T12:03:30.000Z", by: alex.pub, body: { betId: "bet-sunday" },
+    });
+    folded = fold([profile, alexProfile, proposed, accept, acceptAgain]);
+    check("a second accept changes nothing", folded.bets["bet-sunday"].status === "open");
+
+    const push = await signEntry(sam.privateKey, {
+      v: 1, id: "push-1", type: "settle", at: "2026-11-07T15:00:00.000Z", by: sam.pub,
+      body: { betId: "bet-sunday", result: "push" },
+    });
+    folded = fold([profile, alexProfile, proposed, accept, push]);
+    const pushed = standings(folded.bets, folded.names);
+    check("a push counts", pushed.leaderboard.find((row) => row.pub === sam.pub).pushes === 1);
+    check("a push moves no money", pushed.owes.length === 0);
+
+    const voided = await signEntry(sam.privateKey, {
+      v: 1, id: "void-1", type: "settle", at: "2026-11-07T15:00:00.000Z", by: sam.pub,
+      body: { betId: "bet-sunday", result: "void" },
+    });
+    folded = fold([profile, alexProfile, proposed, accept, voided]);
+    check("a void stays off the record", standings(folded.bets, folded.names).leaderboard.every((row) => row.wins + row.losses + row.pushes === 0));
+
+    const pride = await signEntry(sam.privateKey, {
+      v: 1, id: "pride", type: "proposal", at: "2026-11-07T16:00:00.000Z", by: sam.pub,
+      body: proposalBody("bet-pride", 0, 0),
+    });
+    const prideAccept = await signEntry(alex.privateKey, {
+      v: 1, id: "pride-a", type: "accept", at: "2026-11-07T16:01:00.000Z", by: alex.pub, body: { betId: "bet-pride" },
+    });
+    const prideSettle = await signEntry(alex.privateKey, {
+      v: 1, id: "pride-s", type: "settle", at: "2026-11-07T16:02:00.000Z", by: alex.pub,
+      body: { betId: "bet-pride", result: "taker" },
+    });
+    folded = fold([profile, alexProfile, pride, prideAccept, prideSettle]);
+    const prideTable = standings(folded.bets, folded.names);
+    check("a pride bet counts the win", prideTable.leaderboard.find((row) => row.pub === alex.pub).wins === 1);
+    check("a pride bet moves no money", prideTable.owes.length === 0);
+
+    const reopened = await signEntry(sam.privateKey, {
+      v: 1, id: "re-1", type: "reopen", at: "2026-11-07T12:06:00.000Z", by: sam.pub, body: { betId: "bet-sunday" },
+    });
+    folded = fold([profile, alexProfile, proposed, accept, settled, reopened]);
+    check("reopen clears the result", folded.bets["bet-sunday"].status === "open" && !folded.bets["bet-sunday"].winner);
+
+    const bundle = encodeBundle([profile, proposed]);
+    check("bundle round trip", decodeBundle(bundle).length === 2 && bundle.endsWith("~END"));
+    check("bundle ignores a wrapped message", decodeBundle(`Here is the update\n${bundle.slice(0, 24)}\n${bundle.slice(24)}\nthanks`).length === 2);
+    let backupMessage = "";
+    try {
+      decodeBundle(JSON.stringify({ v: 1, kind: "backup", me: { pkcs8: "secret" }, entries: [] }));
+    } catch (error) {
+      backupMessage = error.message;
+    }
+    check("a backup is not an update", backupMessage.includes("backup") && !backupMessage.includes("secret"));
+
+    check("canonical key order", canonical({ b: 1, a: { d: 1, c: 2 } }) === '{"a":{"c":2,"d":1},"b":1}');
+    check("four dollars is 400 minor", toMinor("4", 2) === 400 && fromMinor(400, 2) === 4);
+    check("short bet id rejected", (() => {
+      try {
+        assertProposal(sam.pub, proposalBody("short", 100, 100));
+        return false;
+      } catch {
+        return true;
+      }
+    })());
+
+    const renamed = await signEntry(sam.privateKey, {
+      v: 1, id: "p-sam-2", type: "profile", at: "2026-11-07T18:00:00.000Z", by: sam.pub, body: { name: "Samuel" },
+    });
+    check("the later name wins", fold([profile, renamed]).names[sam.pub] === "Samuel");
+    check("name order follows the entry time", fold([renamed, profile]).names[sam.pub] === "Samuel");
+
+    const failed = log.filter((line) => line.startsWith("FAIL"));
+    const text = `${failed.length ? "FAIL" : "PASS"}\n${log.join("\n")}`;
+    document.getElementById("log").textContent = text;
+    document.title = failed.length ? "FAIL" : "PASS";
+  </script>
+</body>
+</html>
