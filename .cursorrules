@@ -1,0 +1,4 @@
+Follow AGENT_GUIDE.md. Dead Money is the signed phone book from betting_app/web/phone.
+Do not put the private key in an update bundle.
+Do not call fetch from screens. This app has no server.
+Keep MARKER1 envelopes compatible with the web phone.
